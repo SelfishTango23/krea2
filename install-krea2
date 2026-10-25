@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+COMFY="${COMFY_DIR:-/workspace/ComfyUI}"
+LOG="/workspace/install-krea2.log"
+mkdir -p /workspace
+exec > >(tee -a "$LOG") 2>&1
+
+echo "=== Krea2 setup $(date -u +%FT%TZ) ==="
+if [[ ! -f "$COMFY/main.py" ]]; then
+  echo "ERROR: ComfyUI not found at $COMFY; use an existing ComfyUI Vast template." >&2
+  exit 1
+fi
+command -v git >/dev/null || { echo "git is required"; exit 1; }
+command -v curl >/dev/null || { echo "curl is required"; exit 1; }
+
+mkdir -p "$COMFY/custom_nodes" "$COMFY/models"/{diffusion_models,text_encoders,vae,loras}
+
+clone_node() {
+  local repo="$1" dir="$COMFY/custom_nodes/${1##*/}"
+  if [[ -d "$dir/.git" ]]; then
+    echo "EXISTS: $dir"
+  else
+    git clone --depth 1 "https://github.com/$repo.git" "$dir"
+  fi
+}
+clone_node lonecatone23/ComfyUI_LC123_nodes
+clone_node lonecatone23/ComfyUI_LC_Vision_nodes
+clone_node lonecatone23/ComfyUI_LC_AV_nodes
+clone_node lonecatone23/ComfyUI_LC_MaskMaker_nodes
+clone_node lbouaraba/comfyui-krea2edit
+
+if [[ -f /venv/main/bin/activate ]]; then
+  # shellcheck disable=SC1091
+  source /venv/main/bin/activate
+elif [[ -f /opt/venv/bin/activate ]]; then
+  # shellcheck disable=SC1091
+  source /opt/venv/bin/activate
+fi
+
+for req in "$COMFY"/custom_nodes/{ComfyUI_LC123_nodes,ComfyUI_LC_Vision_nodes,ComfyUI_LC_AV_nodes,ComfyUI_LC_MaskMaker_nodes,comfyui-krea2edit}/requirements.txt; do
+  [[ ! -f "$req" ]] || python -m pip install -r "$req"
+done
+
+# Do not expose access tokens in URLs or output logs.
+download() {
+  local folder="$1" filename="$2" url="$3" provider="$4"
+  local target="$COMFY/models/$folder/$filename" tmp="$target.part"
+  local -a args=(--fail --location --retry 20 --retry-delay 5 --retry-all-errors --connect-timeout 40 --silent --show-error --output "$tmp")
+
+  if [[ -s "$target" ]]; then
+    echo "EXISTS (not checksum verified): $target"
+    return 0
+  fi
+  case "$provider" in
+    hf)
+      if [[ -n "${HF_TOKEN:-}" ]]; then args+=(-H "Authorization: Bearer ${HF_TOKEN}"); fi
+      ;;
+    civitai)
+      if [[ -z "${CIVITAI_TOKEN:-}" ]]; then
+        echo "ERROR: CIVITAI_TOKEN missing for $filename" >&2
+        return 1
+      fi
+      args+=(-H "Authorization: Bearer ${CIVITAI_TOKEN}")
+      ;;
+  esac
+  if [[ -s "$tmp" ]]; then args+=(--continue-at -); fi
+  echo "DOWNLOADING: $filename"
+  if ! curl "${args[@]}" "$url"; then
+    echo "FAILED (partial kept): $filename" >&2
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then echo "ERROR: Empty download: $filename" >&2; return 1; fi
+  # Reject obvious HTML/JSON error bodies before promoting a file.
+  if head -c 100 "$tmp" | grep -aqE '^(\{|<!DOCTYPE|<html|<\?xml)'; then
+    echo "ERROR: Server returned an error page, not weights: $filename" >&2
+    return 1
+  fi
+  mv -f "$tmp" "$target"
+  echo "DONE: $target"
+}
+
+failures=0
+fetch() { download "$@" || failures=$((failures+1)); }
+
+# Original user-provided models, no substitutes.
+fetch diffusion_models krea2_turbo_fp8_scaled.safetensors 'https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors' hf
+fetch diffusion_models krea2_turbo_bf16.safetensors 'https://civitai.com/api/download/models/3064584?fileId=2943406' civitai
+fetch diffusion_models raw.safetensors 'https://huggingface.co/krea/Krea-2-Raw/resolve/main/raw.safetensors?download=true' hf
+fetch diffusion_models krealism.safetensors 'https://civitai.com/api/download/models/3139976' civitai
+# Animosity Krea2 Ver 1.0 Turbo, version selected from user's CivitAI version list.
+fetch diffusion_models animosity_krea2_turbo.safetensors 'https://civitai.com/api/download/models/3130436' civitai
+fetch diffusion_models krea2_gguf.gguf 'https://civitai.com/api/download/models/3069586?fileId=2948449' civitai
+fetch text_encoders qwen3vl_4b_fp8_scaled.safetensors 'https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors' hf
+fetch text_encoders qwen3vl_4b_Heritic.safetensors 'https://civitai.com/api/download/models/3066989?fileId=2945735' civitai
+fetch vae qwen_image_vae.safetensors 'https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors' hf
+fetch vae krea2RealVae_v10.safetensors 'https://civitai.com/api/download/models/3068442?fileId=2947164' civitai
+fetch loras krea2_identity_edit_v1_2.safetensors 'https://huggingface.co/conradlocke/krea2-identity-edit/resolve/main/krea2_identity_edit_v1_2.safetensors?download=true' hf
+
+printf '\nModels present:\n'
+find "$COMFY/models" -type f \( -name '*.safetensors' -o -name '*.gguf' \) -printf '%p (%s bytes)\n'
+echo "Failed downloads: $failures"
+if (( failures )); then
+  echo "See $LOG and retry provisioning; check CivitAI region restrictions / HF model permissions." >&2
+  exit 1
+fi
+
+echo "SUCCESS: setup complete. Restart ComfyUI to load custom nodes."
