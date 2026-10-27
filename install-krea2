@@ -45,7 +45,8 @@ done
 # Do not expose access tokens in URLs or output logs.
 download() {
   local folder="$1" filename="$2" url="$3" provider="$4"
-  local target="$COMFY/models/$folder/$filename" tmp="$target.part"
+  local target="$COMFY/models/$folder/$filename"
+  local tmp="${target}.part"
   local -a args=(--fail --location --retry 20 --retry-delay 5 --retry-all-errors --connect-timeout 40 --silent --show-error --output "$tmp")
 
   if [[ -s "$target" ]]; then
